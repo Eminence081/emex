@@ -9,14 +9,20 @@ const app = express();
 const port = Number(process.env.PORT) || 3000;
 const ollamaBaseUrl = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
 const ollamaModel = process.env.OLLAMA_MODEL || "gemma3:4b";
+const geminiApiKey = process.env.GEMINI_API_KEY;
+const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const useGemini = Boolean(geminiApiKey || process.env.VERCEL);
 const maxImageBytes = 5 * 1024 * 1024;
 const maxTextCharacters = 500_000;
 const allowedImageTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const textExtensions = /\.(txt|md|markdown|html|css|js|mjs|cjs|ts|tsx|jsx|json|py|java|php|c|h|cpp|cs|go|rs|rb|sh|sql|xml|yaml|yml)$/i;
+const systemPrompt = "You are Emex AI, a friendly, intelligent, practical assistant. Be clear and natural. Be honest about uncertainty and do not claim to search the web. Ask a concise clarifying question when important details are missing. Format code in fenced Markdown code blocks.";
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "8mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+if (!process.env.VERCEL) {
+  app.use(express.static(path.join(__dirname, "public")));
+}
 
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -58,6 +64,81 @@ async function callOllama(endpoint, options = {}) {
   return data;
 }
 
+async function callGemini(messages, attachment) {
+  if (!geminiApiKey) {
+    const error = new Error("Gemini is not configured. Add GEMINI_API_KEY in your Vercel project settings.");
+    error.status = 503;
+    throw error;
+  }
+
+  const contents = messages.slice(-12).map(({ role, content }) => ({
+    role: role === "assistant" ? "model" : "user",
+    parts: [{ text: content }]
+  }));
+
+  if (attachment) {
+    const lastUserIndex = contents.findLastIndex((message) => message.role === "user");
+    if (lastUserIndex < 0) {
+      const error = new Error("Ask a question along with the attachment.");
+      error.status = 400;
+      throw error;
+    }
+
+    if (attachment.type === "image") {
+      contents[lastUserIndex].parts.push({
+        inlineData: {
+          mimeType: attachment.mimeType,
+          data: attachment.data.slice(attachment.data.indexOf(",") + 1)
+        }
+      });
+    } else {
+      contents[lastUserIndex].parts[0].text += `\n\nAttached file: ${attachment.name}\n\n${attachment.text}`;
+    }
+  }
+
+  let response;
+  try {
+    response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": geminiApiKey
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents
+      }),
+      signal: AbortSignal.timeout(55_000)
+    });
+  } catch {
+    const error = new Error("Could not reach the Gemini API. Please try again.");
+    error.status = 503;
+    throw error;
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    const error = new Error("Gemini returned an invalid response. Please try again.");
+    error.status = 502;
+    throw error;
+  }
+
+  if (!response.ok) {
+    const error = new Error(response.status === 429
+      ? "Gemini's free-tier quota or rate limit was reached. Check your Google AI Studio usage and try again later."
+      : "Gemini could not complete the request. Check the API key and model configured in Vercel.");
+    error.status = response.status === 429 ? 429 : 502;
+    throw error;
+  }
+
+  return data.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text || "")
+    .join("")
+    .trim() || "I could not produce a text response. Please try again.";
+}
+
 function validateMessages(messages) {
   if (!Array.isArray(messages) || messages.length === 0 || messages.length > 24) {
     return "Please send between 1 and 24 recent messages.";
@@ -97,6 +178,19 @@ function validateAttachment(attachment) {
 }
 
 app.get("/api/health", async (_req, res) => {
+  if (useGemini) {
+    const ready = Boolean(geminiApiKey);
+    return res.json({
+      ok: true,
+      provider: "gemini",
+      available: ready,
+      model: geminiModel,
+      modelInstalled: ready,
+      ready,
+      message: ready ? "" : "Add GEMINI_API_KEY in your Vercel project settings to enable chat."
+    });
+  }
+
   try {
     const data = await callOllama("/api/tags", { signal: AbortSignal.timeout(3000) });
     const models = Array.isArray(data.models) ? data.models : [];
@@ -131,7 +225,12 @@ app.post("/api/chat", apiLimiter, async (req, res, next) => {
     const attachmentError = validateAttachment(attachment);
     if (attachmentError) return res.status(400).json({ error: attachmentError });
     if (webSearch) {
-      return res.status(400).json({ error: "Web search is not available in local Ollama mode. Turn off web search to continue." });
+      return res.status(400).json({ error: "Web search is not available in this version. Turn it off to continue." });
+    }
+
+    if (useGemini) {
+      const text = await callGemini(messages, attachment);
+      return res.json({ text, citations: [] });
     }
 
     const input = messages.slice(-12).map(({ role, content }) => ({ role, content }));
@@ -152,10 +251,7 @@ app.post("/api/chat", apiLimiter, async (req, res, next) => {
         model: ollamaModel,
         stream: false,
         messages: [
-          {
-            role: "system",
-            content: "You are Emex AI, a friendly, intelligent, practical assistant. Be clear and natural. Be honest about uncertainty and do not claim to search the web. Ask a concise clarifying question when important details are missing. Format code in fenced Markdown code blocks."
-          },
+          { role: "system", content: systemPrompt },
           ...input
         ]
       })
@@ -176,7 +272,7 @@ app.post("/api/images/generate", apiLimiter, async (req, res, next) => {
       return res.status(400).json({ error: "Enter an image description of up to 4,000 characters." });
     }
     res.status(501).json({
-      error: "Image generation is not included with local Ollama chat. You can continue chatting without API billing."
+      error: "Image generation is not included yet. You can continue chatting."
     });
   } catch (error) {
     next(error);
@@ -190,7 +286,7 @@ app.use((error, _req, res, _next) => {
   }
   const status = Number.isInteger(error.status) ? error.status : 502;
   res.status(status).json({
-    error: status === 503 || status === 502 ? error.message : "The request could not be processed."
+    error: [429, 502, 503].includes(status) ? error.message : "The request could not be processed."
   });
 });
 
@@ -216,4 +312,8 @@ function startServer(startPort) {
   });
 }
 
-startServer(port);
+export default app;
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startServer(port);
+}

@@ -352,7 +352,7 @@ async function generateImage() {
   finally {
     setBusy(false);
     elements.composerHint.textContent = selectedMode === "image"
-      ? "Image generation is not available in local Ollama mode."
+      ? "Image generation is not available yet."
       : "Emex AI can make mistakes. Check important info.";
   }
 }
@@ -392,18 +392,18 @@ function toggleTheme() {
 function updateModeButtons() {
   $("#chatMode").classList.toggle("active", selectedMode === "chat");
   $("#imageMode").classList.toggle("active", selectedMode === "image");
-  $("#composerHint").textContent = selectedMode === "image" ? "Image generation is not available in local Ollama mode." : "Emex AI can make mistakes. Check important info.";
+  $("#composerHint").textContent = selectedMode === "image" ? "Image generation is not available yet." : "Emex AI can make mistakes. Check important info.";
   elements.input.placeholder = selectedMode === "image" ? "Describe an image to generate..." : "Message Emex AI...";
   renderConversation();
 }
 
-async function checkLocalAI() {
+async function checkAI() {
   try {
     const response = await fetch("/api/health");
     const status = await response.json();
-    if (!response.ok || !status.ready) toast(status.message || "The local AI model is not ready.");
+    if (!response.ok || !status.ready) toast(status.message || "The AI service is not ready.");
   } catch {
-    toast("Could not check Ollama. Make sure it is installed and running.");
+    toast("Could not check the AI service. Try refreshing the page.");
   }
 }
 
@@ -445,4 +445,4 @@ document.addEventListener("keydown", (event) => {
 
 setTheme();
 renderConversation();
-checkLocalAI();
+checkAI();
